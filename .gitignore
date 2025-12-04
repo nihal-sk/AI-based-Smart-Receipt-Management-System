@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Node/npm (if you ever use it)
+node_modules/
+
+# Secrets - just in case
+*.env
+.env.*
