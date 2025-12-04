@@ -1,0 +1,1 @@
+# No external dependencies required. AWS Lambda includes boto3 and botocore.
