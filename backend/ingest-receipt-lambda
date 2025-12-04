@@ -1,1 +1,174 @@
+import json
+import boto3
+import urllib.parse
+import uuid
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+
+textract = boto3.client('textract')
+dynamodb = boto3.resource('dynamodb')
+TABLE_NAME = 'receipts'
+table = dynamodb.Table(TABLE_NAME)
+
+def get_s3_from_event(event):
+    try:
+        rec = event['Records'][0]
+        bucket = rec['s3']['bucket']['name']
+        key = rec['s3']['object']['key']
+        return bucket, urllib.parse.unquote_plus(key)
+    except Exception:
+        return None, None
+
+def safe_decimal(value_str):
+    if value_str is None:
+        return None
+    s = str(value_str).strip().replace(',', '').replace('£', '').replace('Rs', '').replace('₹','')
+    s = s.strip()
+    try:
+        return Decimal(s)
+    except (InvalidOperation, ValueError):
+        filtered = ''.join(ch for ch in s if (ch.isdigit() or ch == '.' or ch == '-'))
+        try:
+            return Decimal(filtered) if filtered else None
+        except Exception:
+            return None
+
+def infer_category(vendor: str) -> str:
+    name = (vendor or "").lower()
+
+    # tweak these rules as you like
+   # Online / e-commerce
+    if any(x in name for x in ["Amazon", "Flipkart", "Myntra", "Ajio", "Nykaa", "Meesho", "Alibaba"]):
+        return "Online_shopping"
+
+    # Groceries
+    if any(x in name for x in ["D-Mart", "supermarket", "grocery", "fresh", "bazaar", "Reliance fresh", "more", "Vishal Mart"]):
+        return "groceries"
+
+    # Dining / food
+   if any(x in name for x in ["burger", "pizza", "cafe", "restaurant", "hotel", "burrito"]):
+        return "dining"
+
+    # Shopping / fashion
+    if any(x in name for x in ["zara", "lifestyle", "nike", "adidas", "mall", "Cloth", "Shirt", "t-shirt", "Pant", "trousers", "Lingerie"]):
+        return "shopping"
+
+    # Travel / transport
+    if any(x in name for x in ["Uber", "OLA", "Indigo", "Airlines", "Railway", "Bus", "Rapido", "Namma Yatri"]):
+        return "travel"
+
+    # Banking
+    if any(x in name for x in ["HDFC", "ICICI", "SBI", "Bank", "ATM", "UPI", "Netbanking", "Card", "Paytm", "Phonepe", "Googlepay", "Gpay"]):
+        return "banking"
+
+    # Electricity / water / Mobile / Internet
+    if any(x in name for x in ["Electricity", "Water", "Borewell", "Gas", "gas bill", "DTH", "Broadband", "Internet", "internet bill", "Electricity Bill", "Water Bill", "Airtel", "Vi", "Jio", "BSNL", "Postpaid"]):
+        return "electricity" , "Water" , "Gas", "DTH", "Broadband", "Internet", "Mobile"
+
+    # Entertainment
+    if any(x in name for x in ["Movie", "Netflix", "theatre", "Amazon Prime", "Hotstar", "Zee5", "Spotify", "Youtube", "Cinema"]):
+        return "entertainment
+
+    # Insurance
+    if any(x in name for x in ["Insurance", "Life Insurance", "Health Insurance", "Vehicle Insurance", "Fire Insurance", "Term Insurance", "Travel Insurance", "Home Insurance", "Health", "Life", "Vehicle", "Fire", "Term", "Travel", "Home"]):
+        return "insurance"
+
+    # Fuel
+    if any(x in name for x in ["Fuel", "Petrol", "Diesel", "CNG", "Gas", "gas bill", "E20 petrol"]):
+        return "fuel"
+    
+    # Health
+    if any(x in name for x in ["Health", "Pharmacy", "Doctor", "Hospital", "Medicine", "Clinic", "Ambulance", "Medical"]):
+        return "health"
+
+
+    return "other", "receipt"
+
+def lambda_handler(event, context):
+    print("DEBUG event (truncated):", json.dumps(event)[:3000])
+
+    bucket, key = get_s3_from_event(event)
+    if not bucket or not key:
+        msg = "Missing S3 object info in event. Ensure this Lambda is triggered by S3 ObjectCreated or use a proper S3 test event."
+        print("ERROR:", msg)
+        return {'statusCode': 400, 'body': json.dumps({'error': msg})}
+
+    print(f"Processing s3://{bucket}/{key}")
+
+    # --- Textract AnalyzeExpense ---
+    try:
+        resp = textract.analyze_expense(Document={'S3Object': {'Bucket': bucket, 'Name': key}})
+    except Exception as e:
+        print("Textract analyze_expense error:", str(e))
+        return {'statusCode': 500, 'body': json.dumps({'error': 'textract_failed', 'detail': str(e)})}
+
+    # --- Parse summary fields ---
+    summary = {}
+    for s in resp.get('ExpenseDocuments', []):
+        for f in s.get('SummaryFields', []):
+            t = f.get('Type', {}).get('Text', '').lower()
+            v = f.get('ValueDetection', {}).get('Text', '')
+            if any(k in t for k in ('seller','vendor','merchant')):
+                summary['vendor'] = v
+            elif 'invoice' in t and 'date' in t:
+                summary['invoice_date'] = v
+            elif 'invoice' in t and ('number' in t or 'no' in t):
+                summary['invoice_number'] = v
+            elif any(k in t for k in ('total','amount','total payable','invoice total')):
+                summary['total_raw'] = v
+
+    # --- Line items as list[dict] with string values ---
+    items = []
+    for s in resp.get('ExpenseDocuments', []):
+        for lg in s.get('LineItemGroups', []):
+            for li in lg.get('LineItems', []):
+                row = {}
+                for c in li.get('LineItemExpenseFields', []):
+                    k = c.get('Type', {}).get('Text')
+                    v = c.get('ValueDetection', {}).get('Text') or c.get('Value', '')
+                    if k:
+                        row[str(k)] = str(v) if v is not None else None
+                if row:
+                    items.append(row)
+
+    total_decimal = None
+    if 'total_raw' in summary:
+        total_decimal = safe_decimal(summary['total_raw'])
+
+    vendor = summary.get('vendor')
+    category, receipt_type = infer_category_and_type(vendor)
+
+    # --- For now: hardcode a user id ---
+    user_id = "demo-user"
+
+    receipt_id = str(uuid.uuid4())
+
+    vendor = summary.get("vendor") or summary.get("store_name") or ""
+    category = infer_category(vendor)
+    item = {
+        'receipt_id': receipt_id,
+        'user_id': user_id,
+        's3_path': f"s3://{bucket}/{key}",
+        'vendor': vendor,
+        'invoice_number': summary.get('invoice_number'),
+        'invoice_date': summary.get('invoice_date'),
+        'total': total_decimal if total_decimal is not None else None,
+        'category': category,
+        'receipt_type': receipt_type,
+        'items': items,
+        'processed_at': datetime.utcnow().isoformat(),
+        'raw_resp_json': json.dumps(resp, default=str)
+    }
+
+    # remove None fields
+    item = {k: v for k, v in item.items() if v is not None}
+
+    try:
+        table.put_item(Item=item)
+    except Exception as e:
+        print("DynamoDB put_item error:", str(e))
+        return {'statusCode': 500, 'body': json.dumps({'error': 'dynamodb_failed', 'detail': str(e)})}
+
+    print("✅ Stored receipt:", receipt_id, "for user:", user_id, "category:", category)
+    return {'statusCode': 200, 'body': json.dumps({'receipt_id': receipt_id, 'user_id': user_id})}
 
